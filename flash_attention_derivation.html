@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>FlashAttention &amp; FlashAttention-2 学习笔记</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+<style>
+  body { font-family:'Segoe UI','Microsoft YaHei',sans-serif; padding:48px 64px; background:#fff; color:#222; max-width:1100px; margin:0 auto; line-height:1.9; }
+  h1 { border-bottom:2px solid #3498db; padding-bottom:12px; color:#2c3e50; }
+  h2 { color:#2c3e50; margin-top:36px; border-left:4px solid #3498db; padding-left:12px; }
+  h3 { color:#2c3e50; margin-top:24px; }
+  .ref { background:#f4f6f8; border-left:4px solid #95a5a6; padding:14px 18px; border-radius:4px; margin:18px 0; color:#34495e; }
+  .ref b { color:#2c3e50; }
+  .step { background:#fdfcf6; border-left:4px solid #e67e22; padding:12px 16px; margin:16px 0; border-radius:4px; }
+  .eq { overflow-x:auto; padding:4px 0; }
+  .note { color:#7f8c8d; font-size:0.92em; }
+  table { border-collapse:collapse; margin:16px 0; width:100%; }
+  th,td { border:1px solid #ddd; padding:8px 12px; text-align:left; }
+  th { background:#ecf0f1; }
+  code { background:#f4f4f4; padding:2px 5px; border-radius:3px; font-size:0.9em; }
+</style>
+</head>
+<body>
+
+<h1>FlashAttention &amp; FlashAttention-2 学习笔记</h1>
+<p class="note">依据：<a href="https://arxiv.org/abs/2205.14135">《FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness》(2205.14135)</a> &nbsp;+&nbsp; <a href="https://arxiv.org/abs/2307.08691">《FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning》(2307.08691)</a>。</p>
+
+<div style="background:#eef7ee;border-left:4px solid #27ae60;padding:12px 16px;margin:16px 0;border-radius:4px;">
+<p><b>记号约定</b>：</p>
+<ul>
+<li>$N$：序列长度（token 数）；$d$：每个 head 的维度（$d=d_k=d_v$，如 64/128）。</li>
+<li>$Q,K,V \in \mathbb{R}^{N\times d}$：query / key / value 矩阵（本文只讨论单个 head；多头就是把单头结果沿 head 维拼接）。</li>
+<li>$S = QK^{\top}\in\mathbb{R}^{N\times N}$：<b>注意力分数矩阵</b>（softmax 前的 logits）。</li>
+<li>$P = \mathrm{softmax}(S)\in\mathbb{R}^{N\times N}$：注意力权重矩阵；$O = PV$：输出。</li>
+<li><b>HBM</b>（High Bandwidth Memory，高带宽显存）：GPU 的"内存"，容量大但读写慢（如 A100 40/80GB，带宽 ~2TB/s）。</li>
+<li><b>SRAM</b>（片上高速缓存/共享内存）：GPU 芯片上的缓存，容量极小但读写极快（如 A100 每 SM 192KB，带宽 ~19TB/s）。</li>
+<li>$M$：SRAM 的可用容量（字节）；$B$：分块大小（块行数/列数）。</li>
+<li><b>FLOPs</b>：浮点运算次数；<b>IO</b>：HBM 读写次数（内存访问量）。</li>
+</ul>
+<p class="note">一句话主线：<b>标准 Attention 慢的根源不是计算量，而是把 $N\times N$ 矩阵反复读写 HBM 的 IO 量</b>。FlashAttention 用「分块 + 重计算」把 IO 复杂度从 $O(N^2)$ 降到 $O(N^2 d/M)$，且不牺牲精度（Exact Attention）。</p>
+</div>
+
+<h2>第 0 步：标准 Attention 为什么慢——瓶颈不是计算，是内存</h2>
+<div class="step">
+<p>标准 Attention（单个 head）分三步：</p>
+<div class="eq">$$ S = QK^{\top} \;\in\;\mathbb{R}^{N\times N}, \qquad P = \mathrm{softmax}(S) \;\in\;\mathbb{R}^{N\times N}, \qquad O = PV $$</div>
+<p>其中 $\mathrm{softmax}$ 按<b>行</b>做：$P_{ij} = \dfrac{e^{S_{ij}}}{\sum_{k=1}^{N}e^{S_{ik}}}$。三步都需要在 GPU 上执行：</p>
+<ol>
+<li>算 $S=QK^{\top}$：需要把 $S$（$N\times N$）<b>写回 HBM</b>。</li>
+<li>算 $\mathrm{softmax}(S)$：需要把 $S$ <b>从 HBM 读回</b>，softmax 需要每行的最大值和归一化分母，算完 $P$ 再<b>写回 HBM</b>。</li>
+<li>算 $O=PV$：需要把 $P$ <b>从 HBM 读回</b>，算完 $O$ 再<b>写回 HBM</b>。</li>
+</ol>
+<p>上面说的「写回 HBM / 从 HBM 读回」，<b>另一端</b>是谁？——是 SM 的 <b>SRAM</b>（每块 GPU 上的片上缓存，就是第 1 步要讲的"工作台"）。GPU 上<b>任何计算都只能发生在 SRAM/寄存器里</b>，HBM 里的数据必须先搬进 SRAM 才能参与运算，算出的结果想留下来又得搬回 HBM。所以每一步其实都是一次「<b>HBM ⇄ SRAM</b>」的搬运：</p>
+<table>
+<tr><th>步骤</th><th>从哪读（HBM → SRAM）</th><th>算完写到哪（SRAM → HBM）</th></tr>
+<tr><td>① 算 $S=QK^{\top}$</td><td>$Q$、$K$</td><td>$S$</td></tr>
+<tr><td>② 算 $\mathrm{softmax}(S)$</td><td>$S$</td><td>$P$</td></tr>
+<tr><td>③ 算 $O=PV$</td><td>$P$、$V$</td><td>$O$</td></tr>
+</table>
+<p class="note">注意：$S$ 和 $P$ 这两个 $N\times N$ 中间矩阵<b>在 HBM 里落地了三次、被来回搬了三次</b>——这就是下面 $O(N^2)$ 次 HBM 访问的全部来源。真正的计算量 $O(N^2 d)$ 一点没省，慢就慢在搬这三次账本。</p>
+<div style="background:#eef4fb;border-left:4px solid #8e9cc3;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>🔍 用数字感受一下（N=1024，d=64）</b></p>
+<p>标准 Attention 对 $S,P$ 的 HBM 读写量：</p>
+<div class="eq">$$ \underbrace{O(N^2)}_{\text{写 }S} + \underbrace{O(N^2)}_{\text{读 }S\text{、写 }P} + \underbrace{O(N^2)}_{\text{读 }P} = O(N^2) \text{ 次 HBM 访问} $$</div>
+<p>而计算量只有 $O(N^2 d)$ 次 FLOPs。当 $d$ 不大（如 64）时，<b>内存访问量 $O(N^2)$ 与计算量 $O(N^2 d)$ 同数量级甚至更大</b>——GPU 大部分时间在"搬运数据"，而不是"计算"。N 越大（长序列），$N\times N$ 矩阵越占据主导，内存瓶颈越严重。</p>
+<p class="note"><b>类比</b>：想象一个仓库（HBM，很大但来回搬货慢）和一个工作台（SRAM，很小但操作极快）。标准 Attention 的做法是：把 $N\times N$ 的"账本"整个搬进仓库，每次算一步就回仓库翻一次账本——来回搬 $N^2$ 次。FlashAttention 的做法是：把账本切成小片，每次只在工作台上处理一小片，算完就丢掉，全程几乎不回仓库。</p>
+</div>
+</div>
+
+<h2>第 1 步：GPU 内存层级——为什么要"IO-aware"</h2>
+<div class="step">
+<p>GPU 的内存是不对称的（这正是论文标题里 <b>IO-Awareness</b> 的由来）：</p>
+<table>
+<tr><th></th><th>容量</th><th>带宽</th><th>角色</th></tr>
+<tr><td><b>HBM</b></td><td>大（A100 40/80GB）</td><td>~2TB/s</td><td>主存储器（显存）</td></tr>
+<tr><td><b>SRAM</b></td><td>极小（A100 每 SM 192KB）</td><td>~19TB/s</td><td>片上缓存（每 SM 的共享内存）</td></tr>
+</table>
+<p class="note">SRAM 带宽是 HBM 的 <b>~10 倍</b>，但容量小好几个数量级。所以最优策略是：<b>尽量让数据在 SRAM 里反复用，少回 HBM</b>。</p>
+<p class="note"><b>寄存器 vs SRAM</b>（两者都算"片上"，和 HBM 相对）：<b>寄存器</b>是每个线程<b>私有</b>的存储，最快也最小（A100 每 SM 约 256KB，分给单个线程最多 255 个）；<b>SRAM</b>（Shared Memory，共享内存）是同一 SM 内<b>所有线程共享</b>的协作工作台（A100 每 SM 192KB）。物理上二者都是 SRAM 工艺，但论文里说的"SRAM"特指共享内存——分块时 $Q,K,V$ 的块就是搬进它，而做乘加的中间值（$S$ 的行、running max/sum）放寄存器。对本文结论，只需记住「<b>片外 HBM（慢）↔ 片上（快）</b>」这一层对偶即可。</p>
+
+<p>传统观点认为 Attention 的瓶颈是"计算量 $O(N^2)$"，于是很多人去做<b>近似</b>（稀疏、低秩、线性化），试图减少计算。但论文指出：<b>真正的瓶颈是 IO（HBM 访问）</b>，即使计算量减半，如果 IO 还是 $O(N^2)$，墙钟时间也不会快多少。因此提出了一个原则：</p>
+<div style="background:#eef7ee;border-left:4px solid #27ae60;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>核心原则</b>：设计 attention 算法时，要把「读写 HBM 的次数」作为一等的优化目标，而不仅仅是 FLOPs。</p>
+</div>
+</div>
+
+<h2>第 2 步：核心三招总览</h2>
+<div class="step">
+<p>FlashAttention 用<b>三招</b>实现「Exact（不近似）+ 少 IO」：</p>
+<table>
+<tr><th>招式</th><th>做什么</th><th>解决什么问题</th></tr>
+<tr><td><b>① Tiling 分块</b></td><td>把 $Q,K,V$ 切成块，每次只把一块读进 SRAM，逐块算</td><td>避免把 $N\times N$ 的 $S,P$ 写回 HBM</td></tr>
+<tr><td><b>② Online Softmax</b></td><td>分块时用「running max + running sum」增量维护 softmax 的归一化，最后再重缩放</td><td>softmax 需要全局信息，但只能看局部块</td></tr>
+<tr><td><b>③ 反向重计算</b></td><td>反向传播时不保存 $N\times N$ 的注意力矩阵，而是用存的 $P$ 的统计量重新算</td><td>省内存：显存占用从 $O(N^2)$ 降到 $O(N)$</td></tr>
+</table>
+<p class="note">①② 是前向的核心，③ 是反向的核心。三者合起来：<b>显存 $O(N)$、IO $O(N^2d/M)$、结果与标准 Attention 逐位一致（Exact）</b>。</p>
+</div>
+
+<h2>第 3 步：Tiling 分块——如何避免写回 $N\times N$ 矩阵</h2>
+<div class="step">
+<p>关键观察：输出 $O = \mathrm{softmax}(QK^{\top})\,V$ 的<b>每一行只依赖 $Q$ 的对应一行</b>，以及全部的 $K,V$。于是可以<b>按行分块</b>处理 $Q$：</p>
+<div class="eq">$$ Q = \begin{pmatrix} Q_1 \\ Q_2 \\ \vdots \\ Q_{T_r} \end{pmatrix}, \quad K = \begin{pmatrix} K_1 &amp; K_2 &amp; \cdots &amp; K_{T_c} \end{pmatrix}, \quad V = \begin{pmatrix} V_1 \\ V_2 \\ \vdots \\ V_{T_c} \end{pmatrix} $$</div>
+<p>其中每个 $Q_i$ 是 $B_r\times d$ 块，每个 $K_j,V_j$ 是 $d\times B_c$ 块（$B_r,B_c$ 由 SRAM 容量决定）。对第 $i$ 行的 $Q_i$，遍历所有 $j$ 列块：</p>
+<div class="eq">$$ S_{ij} = Q_i K_j^{\top} \;\in\;\mathbb{R}^{B_r\times B_c}, \qquad \text{（块内 softmax）} \quad \widetilde{P}_{ij} = \mathrm{softmax}(S_{ij}), \qquad O_i \mathrel{+}= \widetilde{P}_{ij} V_j $$</div>
+<p class="note">问题来了：<b>块内 softmax 不是全局 softmax</b>——真正的 $\mathrm{softmax}$ 需要对整行归一化，而分块时我们只看了这一行的部分列。这就是第 4 步 Online Softmax 要解决的。</p>
+
+<div style="background:#eef4fb;border-left:4px solid #8e9cc3;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>🔍 具体数字：为什么分块能省 IO</b></p>
+<p>设 $N=1024, d=64$，SRAM 装得下 $B=64$ 行。标准做法：$S,P$ 全程驻留 HBM，读写 $O(N^2)\approx 10^6$ 次。分块做法：每次只在 SRAM 里算 $64\times64$ 的小块，算完累加到 $O_i$（$O_i$ 可留在 SRAM），<b>从不把完整的 $S,P$ 写回 HBM</b>，HBM 访问降为 $O(N^2 d/M)$。</p>
+</div>
+</div>
+
+<h2>第 4 步：Online Softmax——分块时怎么维护全局归一化</h2>
+<div class="step">
+<p>Softmax 需要两样全局信息：<b>行最大值</b>（数值稳定）和<b>归一化分母</b>（指数和）。分块时我们逐块扫描，于是维护两个<b>running</b>量，每处理一块就更新一次：</p>
+
+<p><b>① 记法</b>：对输出 $O$ 的第 $i$ 行，设已处理前 $j$ 个列块后：
+- $m_i^{(j)}$：已见 logits 的<b>行最大值</b>；
+- $l_i^{(j)}$：已见 logits 的<b>指数和</b>（归一化分母，含重缩放）；
+- $O_i^{(j)}$：用当前归一化算出的<b>部分输出</b>。</p>
+
+<p><b>② 处理第 $j+1$ 块</b>（$S_{ij}$ 是 $Q_iK_j^{\top}$）时，更新规则：</p>
+<div class="eq">$$ m_i^{(j+1)} = \max\big(m_i^{(j)},\; \mathrm{rowmax}(S_{ij})\big) $$</div>
+<div class="eq">$$ l_i^{(j+1)} = e^{\,m_i^{(j)}-m_i^{(j+1)}}\,l_i^{(j)} + \mathrm{rowsum}\big(e^{\,S_{ij}-m_i^{(j+1)}}\big) $$</div>
+<div class="eq">$$ O_i^{(j+1)} = e^{\,m_i^{(j)}-m_i^{(j+1)}}\,O_i^{(j)} + e^{\,S_{ij}-m_i^{(j+1)}}\,V_j $$</div>
+
+<p><b>③ 直觉</b>：新块来了，先看它的最大值是否超过旧的 $m$。若超过了，说明之前算的部分输出<b>被高估了</b>，需要用因子 $e^{m^{old}-m^{new}}$ <b>整体重缩放</b>（把之前所有项的指数基准降到新最大值），再累加新块。若没超过，$e^{m^{old}-m^{new}}=e^0=1$，直接累加即可。</p>
+
+<div style="background:#eef4fb;border-left:4px solid #8e9cc3;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>🔍 具体数字例子</b>（一行 logits，先来 3 个数，再来 2 个数）</p>
+<p>第一块：logits = $[2,\ 1,\ 0]$。最大值 $m=2$，归一化：$e^{[0,-1,-2]}=[1,\ 0.37,\ 0.14]$，分母 $l=1.51$，部分输出 $O^{(1)}$（按这些权重加权 $V$）。</p>
+<p>第二块：logits = $[3,\ 5]$。新最大值 $\max(2,5)=5$ <b>超过了</b>！于是：</p>
+<div class="eq">$$ l^{(2)} = e^{2-5}\cdot 1.51 + \big(e^{3-5}+e^{5-5}\big) = 0.050\cdot 1.51 + (0.135+1) = 1.21 $$</div>
+<p class="note">第一块的贡献被 $e^{2-5}=0.050$ 重缩放（因为基准从 2 抬到 5，它们的指数都变小了），第二块 $[e^{-2}, e^{0}]=[0.135,1]$ 直接按新基准算。最终分母 $l=1.21$，任何一块的权重 = 该块贡献 / 1.21。</p>
+<p>全部块处理完后，<b>最后做一次归一化</b>：$O_i = O_i^{(T_c)} / l_i^{(T_c)}$（$T_c$ 是列块总数）。</p>
+</div>
+
+<p class="note"><b>为什么叫 "Online"</b>：像在线算法一样，一次只看到一块数据，但维护的统计量（$m,l,O$）保证最终结果与"一次性看完全部数据"的 softmax <b>完全一致</b>（Exact，不是近似）。</p>
+</div>
+
+<h2>第 5 步：FlashAttention 前向算法（Algorithm 1）</h2>
+<div class="step">
+<p>把上面三部分拼起来，就是论文的 Algorithm 1。伪代码（$Q,K,V\in\mathbb{R}^{N\times d}$，SRAM 容量 $M$，块大小 $B_r,B_c$）：</p>
+<div style="background:#f4f6f8;border:1px solid #ddd;padding:14px 18px;border-radius:4px;font-family:'Consolas',monospace;font-size:0.95em;line-height:2;">
+<b>Algorithm 1</b> (FlashAttention Forward)<br>
+1. 设块大小 $B_r = \lceil M/4d\rceil$，$B_c = \lceil M/4d\rceil$（让 $Q,K,V,O,S$ 各占约 1/4 SRAM）。<br>
+2. <b>for</b> $j = 1$ to $T_c$（$T_c = \lceil N/B_c\rceil$，列块）: <br>
+3. &nbsp;&nbsp; 从 HBM 读 $K_j, V_j$ 到 SRAM。<br>
+4. <b>for</b> $i = 1$ to $T_r$（$T_r = \lceil N/B_r\rceil$，行块）: <br>
+5. &nbsp;&nbsp;&nbsp;&nbsp; 从 HBM 读 $Q_i$ 到 SRAM，读 $O_i, l_i, m_i$ 到 SRAM。<br>
+6. &nbsp;&nbsp;&nbsp;&nbsp; 在 SRAM 内算 $S_{ij} = Q_i K_j^{\top}$。<br>
+7. &nbsp;&nbsp;&nbsp;&nbsp; 算 $\widetilde{m}_{ij} = \mathrm{rowmax}(S_{ij})$，$P_{ij} = e^{S_{ij} - \widetilde{m}_{ij}}$。<br>
+8. &nbsp;&nbsp;&nbsp;&nbsp; 算 $\widetilde{l}_{ij} = \mathrm{rowsum}(P_{ij})$。<br>
+9. &nbsp;&nbsp;&nbsp;&nbsp; 更新 $m_i^{\mathrm{new}} = \max(m_i, \widetilde{m}_{ij})$。<br>
+10. &nbsp;&nbsp;&nbsp;&nbsp; 重缩放 $P_{ij} \leftarrow P_{ij}\cdot e^{\,m_i - m_i^{\mathrm{new}}}$，$\widetilde{l}_{ij} \leftarrow \widetilde{l}_{ij}\cdot e^{\,m_i - m_i^{\mathrm{new}}}$。<br>
+11. &nbsp;&nbsp;&nbsp;&nbsp; 更新 $l_i \leftarrow l_i + \widetilde{l}_{ij}$。<br>
+12. &nbsp;&nbsp;&nbsp;&nbsp; 更新 $O_i \leftarrow O_i\cdot e^{\,m_i - m_i^{\mathrm{new}}} + P_{ij}V_j$。<br>
+13. &nbsp;&nbsp;&nbsp;&nbsp; 设 $m_i \leftarrow m_i^{\mathrm{new}}$，把 $O_i, l_i, m_i$ 写回 HBM。<br>
+14. <b>end for</b><br>
+15. <b>end for</b><br>
+16. <b>for</b> $i=1$ to $T_r$: $O_i \leftarrow \mathrm{diag}(l_i)^{-1} O_i$（最后归一化）。<br>
+17. <b>return</b> $O$.
+</div>
+
+<p class="note">要点：<b>内层循环里 $S_{ij}$、$P_{ij}$ 都只活在 SRAM</b>，从不写回 HBM——这就是 IO 省下来的地方。$O_i,l_i,m_i$ 每处理一个列块才回一次 HBM。</p>
+</div>
+
+<h2>第 6 步：IO 复杂度分析——为什么是 $O(N^2d/M)$ 且最优</h2>
+<div class="step">
+<p>论文给出标准 Attention 与 FlashAttention 的 HBM 访问量（IO 复杂度）：</p>
+<table>
+<tr><th></th><th>HBM 访问量（IO）</th><th>显存占用</th></tr>
+<tr><td>标准 Attention</td><td>$O(N^2 + Nd)$</td><td>$O(N^2)$</td></tr>
+<tr><td>FlashAttention</td><td>$O(N^2 d^2 / M)$</td><td>$O(N)$</td></tr>
+</table>
+<p class="note">注：$N$ 是序列长度，$d$ 是 head 维度，$M$ 是 SRAM 容量（字节）。标准 Attention 的 $O(N^2)$ 来自 $S,P$ 的读写；FlashAttention 的 $O(N^2 d^2/M)$ 来自 $Q,K,V$ 块在各行块间的重复读取。</p>
+
+<div style="background:#eef4fb;border-left:4px solid #8e9cc3;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>🔍 直观理解 IO 复杂度</b></p>
+<p>FlashAttention 的 IO = $O(N^2 d^2 / M)$。为什么？</p>
+<p>总共有 $T_r \times T_c = \frac{N}{B_r}\cdot\frac{N}{B_c}$ 对 (行块, 列块)。每对要读 $Q_i$（$B_r d$ 个数）、$K_j, V_j$（各 $B_c d$ 个数）。设 $B_r = B_c = B$，则总读取量：</p>
+<div class="eq">$$ \frac{N}{B}\cdot\frac{N}{B}\cdot\big(Bd + Bd + Bd\big) = \frac{3N^2 d}{B} $$</div>
+<p>而 SRAM 能同时装下 $Q,K,V,O$ 四个块，故 $B \approx M/(4d)$，代入得：</p>
+<div class="eq">$$ \text{IO} = \frac{3N^2 d}{M/(4d)} = O\!\left(\frac{N^2 d^2}{M}\right) $$</div>
+<p>当 $d^2 \ll M$（常见：$d=64, d^2=4096 \ll M\approx 10^5$）时，$N^2 d^2/M \ll N^2$，<b>远小于标准 Attention 的 $O(N^2)$</b>。</p>
+</div>
+
+<p><b>最优性</b>：论文进一步证明，对任意 SRAM 容量 $M$，这个 IO 复杂度是<b>下界可达的</b>（不可能比它更低，除非用近似）。这是通过「信息论 / 平摊分析」证明的：每个 $Q$ 块必须至少读一遍所有 $K,V$ 数据，而 SRAM 一次装不下全部，所以总读取量有一个下界，FlashAttention 达到这个下界。</p>
+</div>
+
+<h2>第 7 步：反向传播——用重计算换显存</h2>
+<div class="step">
+<p>标准 Attention 的反向传播需要 $S$（或 $P$）来计算梯度，所以前向时把 $N\times N$ 的 $P$ 存下来——这是 $O(N^2)$ 显存的来源。</p>
+<p>FlashAttention 的做法：<b>反向时不存 $P$，而是重新计算</b>。前向只需要把每块的 <b>$O_i, l_i, m_i$</b>（都是 $O(N)$ 的量）存到 HBM。反向时：</p>
+<ol>
+<li>重新读入 $Q_i, K_j, V_j$ 块；</li>
+<li>在 SRAM 里<b>重新计算</b> $S_{ij}$ 和 $P_{ij}$（用存的 $m_i, l_i$ 恢复归一化）；</li>
+<li>用这些重新算出的 $P_{ij}$ 计算梯度 $\mathrm{d}S, \mathrm{d}Q, \mathrm{d}K, \mathrm{d}V$。</li>
+</ol>
+<p class="note"><b>权衡</b>：重计算让反向的 FLOPs 增加了约 1/3（重新算一遍 softmax），但换来了<b>显存从 $O(N^2)$ 降到 $O(N)$</b>——长序列下显存往往比 FLOPs 更珍贵（显存不够直接跑不了）。这就是「用计算换内存」的典型交换。</p>
+
+<div style="background:#eef4fb;border-left:4px solid #8e9cc3;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>🔍 为什么显存是 $O(N)$</b></p>
+<p>存的量：$O$（$N\times d$）、$l, m$（各 $N$）、$Q,K,V$ 本身（各 $N\times d$），全部 $O(Nd)$。$N\times N$ 的 $P$ 从不落地。所以显存与 $N$ 线性增长，而不是平方。</p>
+</div>
+</div>
+
+<h2>第 8 步：FlashAttention-2——三大改进（更快，还是 Exact）</h2>
+<div class="step">
+<p>FlashAttention 已经省了 IO，但论文发现它<b>只达到 A100 理论峰值 FLOPs 的 25–40%</b>，远不如 GEMM（矩阵乘）的 ~80%。瓶颈不是 IO，而是<b>并行度不够和工作划分不合理</b>。FlashAttention-2 做了三处改进：</p>
+
+<h3>改进 ①：减少非 matmul 的 FLOPs</h3>
+<p>FlashAttention-1 里 softmax 的归一化、重缩放、$\exp$ 等<b>非矩阵乘</b>操作占用不少时间。FlashAttention-2 的技巧：</p>
+<ul>
+<li>把缩放因子 $1/\sqrt{d}$ <b>融合进 $S=QK^{\top}$ 的计算</b>（算 $QK^{\top}$ 时直接乘上），而不是在 softmax 后单独乘。</li>
+<li>减少重缩放次数：把 $m_i^{\mathrm{new}} = \max(m_i, \widetilde m_{ij})$ 的更新与 $e^{S-\widetilde m}$ 的计算合并，<b>只在必要时重缩放</b>，减少 $\exp$ 和乘法。</li>
+</ul>
+<p class="note">矩阵乘（GEMM）是 GPU 最擅长的操作（张量核心专门加速它）；非 matmul 操作（$\exp$、除法、逐元素乘）跑得慢。所以「把更多工作变成 matmul、减少非 matmul」就能提速。</p>
+
+<h3>改进 ②：单个 head 也跨 thread block 并行</h3>
+<p>FlashAttention-1 的并行策略：<b>一个 thread block 负责一个 head</b>（或一个 (head, 行块) 对）。当序列长、head 少时，thread block 数不够，GPU 占用率（occupancy）低。</p>
+<p>FlashAttention-2 的改进：<b>把 K、V 的列维度也切开</b>，多个 thread block 并行处理同一个 head 的不同列块，最后再合并。这样即使只有一个 head，也能占满 GPU 的所有 SM。</p>
+<div class="eq">$$ \text{FlashAttention-1：每个 thread block 算整个 head 的所有列} $$</div>
+<div class="eq">$$ \text{FlashAttention-2：一个 head 的列被切成多块，多 block 并行算，再 reduce} $$</div>
+
+<h3>改进 ③：warp 间工作分配，减少 shared memory 通信</h3>
+<p>一个 thread block 内有多个 warp（线程束）。FlashAttention-1 把 $Q$ 切成两份分给 warp，导致 warp 之间需要多次<b>通过 shared memory 交换 $K,V$</b>，产生额外通信和 <b>bank conflict</b>（共享内存访问冲突）。</p>
+<p>FlashAttention-2 的改进：</p>
+<ul>
+<li><b>让每个 warp 独立计算一部分 $Q$ 的所有列</b>（而不是让 warp 共享 K/V 的搬运），减少 warp 间通信。</li>
+<li>把「每个 warp 算 $Q$ 的哪一块」重新划分，使 $K,V$ 的读取更规整，<b>避免 bank conflict</b>。</li>
+<li>对 $Q$ 的划分更细，使每个 warp 都有足够的独立工作。</li>
+</ul>
+</div>
+
+<h2>第 9 步：效果与对比</h2>
+<div class="step">
+<table>
+<tr><th>指标</th><th>FlashAttention</th><th>FlashAttention-2</th></tr>
+<tr><td>HBM 访问（IO）</td><td>$O(N^2d^2/M)$（最优）</td><td>同左（IO 已最优，不再动）</td></tr>
+<tr><td>显存占用</td><td>$O(N)$</td><td>$O(N)$</td></tr>
+<tr><td>达到 A100 理论峰值</td><td>25–40%</td><td>50–73%</td></tr>
+<tr><td>相对前代加速</td><td>比标准快 2–4×</td><td>比 FlashAttention 再快 ~2×</td></tr>
+<tr><td>端到端训练（GPT 类）</td><td>—</td><td>225 TFLOPs/s per A100（72% 利用率）</td></tr>
+<tr><td>精度</td><td>Exact（逐位一致）</td><td>Exact</td></tr>
+</table>
+
+<p>FlashAttention 的实测效果（论文数据）：</p>
+<ul>
+<li>BERT-large（seq 512）端到端训练提速 <b>15%</b>（对比 MLPerf 1.1 记录）。</li>
+<li>GPT-2（seq 1K）提速 <b>3×</b>；Long Range Arena（seq 1K–4K）提速 <b>2.4×</b>。</li>
+<li>让 Transformer 首次在 Path-X（seq 16K，61.4% 准确率）和 Path-256（seq 64K，63.1%）上超过随机猜测——<b>长序列新能力</b>。</li>
+</ul>
+
+<div style="background:#eef7ee;border-left:4px solid #27ae60;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>📌 与 RoPE 推导页的衔接</b></p>
+<p>你刚学的 MLA（DeepSeek-V2）文章里也提到：<b>Prefill 阶段用 MHA 形式算、Generation 阶段用 MQA 形式算</b>。而 FlashAttention 正是这类推理/训练加速的底层支撑——它让长序列的 attention 不再被 $N\times N$ 矩阵的 IO 卡死。两者配合：<b>FlashAttention 解决"内存/IO 装不下、搬不动"，MLA 解决"KV Cache 太大"</b>，是优化长序列 Transformer 的两个不同维度。</p>
+</div>
+</div>
+
+<h2>来源对照</h2>
+<div class="ref">
+<table>
+<tr><th>内容</th><th>来源</th></tr>
+<tr><td>IO-Awareness、Tiling、Online Softmax、重计算、IO 复杂度分析</td><td>FlashAttention (2205.14135)</td></tr>
+<tr><td>Algorithm 1（前向）伪代码</td><td>FlashAttention (2205.14135) 第 3.2 节</td></tr>
+<tr><td>IO 复杂度 $O(N^2d^2/M)$ 及最优性</td><td>FlashAttention (2205.14135) 第 3.3 节、Theorem 1/2</td></tr>
+<tr><td>减少非 matmul FLOPs、跨 block 并行、warp 划分</td><td>FlashAttention-2 (2307.08691) 第 3 节</td></tr>
+<tr><td>端到端训练 225 TFLOPs/s（72%）</td><td>FlashAttention-2 (2307.08691) 摘要/实验</td></tr>
+<tr><td>标准 Attention 公式 $O=\mathrm{softmax}(QK^{\top})V$</td><td>《Attention is All You Need》(1706.03762)</td></tr>
+</table>
+</div>
+
+</body>
+</html>

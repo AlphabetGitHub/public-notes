@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RoPE 远程衰减推导：式(14)(15)</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false});"></script>
+<style>
+  body { font-family:'Segoe UI','Microsoft YaHei',sans-serif; padding:48px 64px; background:#fff; color:#222; max-width:1100px; margin:0 auto; line-height:1.9; }
+  h1 { border-bottom:2px solid #3498db; padding-bottom:12px; color:#2c3e50; }
+  h2 { color:#2c3e50; margin-top:36px; border-left:4px solid #3498db; padding-left:12px; }
+  .ref { background:#f4f6f8; border-left:4px solid #95a5a6; padding:14px 18px; border-radius:4px; margin:18px 0; color:#34495e; }
+  .ref b { color:#2c3e50; }
+  .step { background:#fdfcf6; border-left:4px solid #e67e22; padding:12px 16px; margin:16px 0; border-radius:4px; }
+  .eq { overflow-x:auto; padding:4px 0; }
+  .note { color:#7f8c8d; font-size:0.92em; }
+  table { border-collapse:collapse; margin:16px 0; width:100%; }
+  th,td { border:1px solid #ddd; padding:8px 12px; text-align:left; }
+  th { background:#ecf0f1; }
+</style>
+</head>
+<body>
+
+<h1>RoPE 远程衰减证明：式 (14)、(15) 的推导</h1>
+<p class="note">依据：<a href="https://www.spaces.ac.cn/archives/8231">《Transformer升级之路：1、Sinusoidal位置编码追根溯源》(8231)</a> 的复数方法与定义 &nbsp;+&nbsp; <a href="https://www.spaces.ac.cn/archives/8265">《Transformer升级之路：2、博采众长的旋转式位置编码》(8265)</a> 的 RoPE 定义与远程衰减推导。</p>
+
+<div style="background:#eef7ee;border-left:4px solid #27ae60;padding:12px 16px;margin:16px 0;border-radius:4px;">
+<p><b>🛠 实际操作流程（最关键，先看这里）</b>——RoPE 在模型里具体怎么算：</p>
+<ol>
+<li><b>投影</b>：从词 embedding 出发，经线性变换得到 $Q,K,V$（$Q$ 第 $m$ 行、$K$ 第 $n$ 行分别为 $q_m,k_n$）。</li>
+<li><b>旋转 $Q,K$</b>：对每个位置的 $q_m$ 左乘 $R(m\theta)$、对每个位置的 $k_n$ 左乘 $R(n\theta)$。注意 <b>$V$ 不旋转</b>——RoPE 只作用于 $Q,K$。</li>
+<li><b>点积</b>：用旋转后的结果算注意力分数 $(R(m\theta)q_m)^{\top}(R(n\theta)k_n)$。</li>
+</ol>
+<p class="note">实现细节：实际代码（如 Llama/Qwen 的 <code>apply_rotary_pos_emb</code>）不显式构造 $R(m\theta)$ 这个大矩阵，而是对每对维度直接做旋转公式：$\begin{pmatrix} q_{2i}' \\ q_{2i+1}' \end{pmatrix}=\begin{pmatrix} q_{2i}\cos m\theta_i - q_{2i+1}\sin m\theta_i \\ q_{2i}\sin m\theta_i + q_{2i+1}\cos m\theta_i \end{pmatrix}$——数学上与左乘块对角 $R(m\theta)$ 完全等价，只是省去构造矩阵。</p>
+<p class="note">符号速览：$m,n$ 是 query/key 的<b>绝对位置编号</b>，$R(m\theta)$ 是<b>块对角旋转矩阵</b>，频率 $\theta_i=10000^{-2i/d}$（详见下方记号约定）。</p>
+</div>
+
+<p class="note"><b>📑 阅读导览</b>：<b>必读</b>＝① 上面的操作流程 → ② 第 1 步（复数/矩阵形式）→ ③ 第 2 步（相对位置如何出现）。<b>选读</b>＝第 3~5 步（证明 RoPE 的<b>远程衰减</b>性质，与操作无关）。</p>
+
+<div style="background:#eef7ee;border-left:4px solid #27ae60;padding:12px 16px;margin:16px 0;border-radius:4px;">
+<p><b>记号约定</b>：全文用 $\top$ 表示<b>转置</b>（$q^{\top}$、$R^{\top}$），用 $^{*}$ 表示<b>取共轭复数</b>（若 $z=a+bi$，则 $z^{*}=a-bi$）。</p>
+<p><b>三个变量的含义</b>：</p>
+<ul>
+<li>$m,n$：<b>绝对位置编号</b>——序列中第几个 token 就编号几（第 1 个 token $m=0$，第 2 个 $m=1$，……）。$m$ 是 query 所在位置，$n$ 是 key 所在位置，相对位置就是 $n-m$（如"我喜欢学习"里算"学"对"我"的注意力，$m=2,n=0,n-m=-2$）。</li>
+<li>$\theta$：<b>频率向量</b>——共 $d/2$ 个分量，由公式 $\theta_i = 10000^{-2i/d}$ 确定（$i=0,\ldots,d/2-1$；$d$ 是 head 维度，$10000$ 是底数超参）。展开为列向量：
+<div class="eq">$$ \theta = \big(\theta_0,\; \theta_1,\; \ldots,\; \theta_{d/2-1}\big)^{\top}, \qquad \theta_i = 10000^{-2i/d} $$</div>
+分量 $\theta_0=10000^0=1$ 频率最高（转得最快）、$\theta_{d/2-1}=10000^{-(d-2)/d}\approx 1/10000$ 频率最低，高频率捕捉近距离、低频率捕捉远距离的相对位置。</li>
+<li>$\theta$ 的<b>下标 $i$ 来自维度分组</b>：把全部 $d$ 个嵌入维度<b>两两一组</b>（$d/2$ 组），第 $i$ 组是 $(q_{2i},\,q_{2i+1})$，它对应的频率就是 $\theta_i$。所以 $\theta_i$ 的下标 $i$ 正是「维度组号」——$i=0$ 管 $(q_0,q_1)$、$i=1$ 管 $(q_2,q_3)$、……、$i=d/2-1$ 管 $(q_{d-2},q_{d-1})$。等价地，$i$ 是「组内起始维度的索引除以 2」（第 $i$ 组的首维下标是 $2i$）。</li>
+<li>$R(m\theta)$：<b>块对角旋转矩阵</b>——对角线 $d/2$ 个 $2\times2$ 旋转块，第 $i$ 块 $R(m\theta_i)$ 在 $(q_{2i},q_{2i+1})$ 上旋转角度 $m\theta_i$。</li>
+</ul>
+<p class="note">合起来：$m,n$ 是"输入"（序列自动给定），$\theta$ 是"设计好的尺子"（公式给定），乘积 $(n-m)\theta_i$ 才是第 $i$ 对维度实际转进去的相对角度。</p>
+</div>
+
+<h2>第 0 步：从 8231 借用的定义</h2>
+<div class="ref">
+<p><b>记号</b>：$p_m=\begin{pmatrix}a\\b\end{pmatrix}$、$p_n=\begin{pmatrix}c\\d\end{pmatrix}$ 一律表示<b>二维实列向量</b>。需要把它看成复数时，写成 $(1,\ i)\,p_m=a+bi$（<b>行向量</b> $(1,i)$ 左乘列向量 $p_m$），即实部 = 第 0 分量、虚部 = 第 1 分量。</p>
+<p><b>8231 式 (6)</b> —— 内积 = 复数相乘取实部（二维向量看成复数）：</p>
+<div class="eq">$$ \langle p_m, p_n \rangle = \operatorname{Re}\big[(1,\ i)\,p_m\cdot\big((1,\ i)\,p_n\big)^{*}\big] $$</div>
+<p class="note">因为 $\langle p_m,p_n \rangle$ 是实内积，而 $(1,\ i)p_m\cdot\big((1,\ i)p_n\big)^{*}$ 一般是复数，所以取实部 $\operatorname{Re}[\cdot]$ 才回到实数。例：$p_m=(\cos m\theta,\ \sin m\theta)^{\top}$，则 $(1,\ i)p_m=\cos m\theta+i\sin m\theta=e^{im\theta}$，同理 $(1,\ i)p_n=e^{in\theta}$，于是内积 $=\operatorname{Re}[e^{im\theta}(e^{in\theta})^{*}]=\operatorname{Re}[e^{i(m-n)\theta}]$。</p>
+
+<div style="background:#f4f9f4;border-left:4px solid #7fb069;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>证明这个等式成立</b>：设 $p_m=\binom{a}{b}$、$p_n=\binom{c}{d}$ 是二维实列向量，则 $(1,\ i)p_m=a+bi$、$(1,\ i)p_n=c+di$。</p>
+<p><b>左边</b>——实内积（点积）按定义逐分量相乘再相加：</p>
+<div class="eq">$$ \langle p_m,p_n \rangle = ac + bd $$</div>
+<p><b>右边</b>——先算复数相乘 $\big((1,\ i)p_m\big)\big((1,\ i)p_n\big)^{*}$（共轭把虚部取负，再展开四项）：</p>
+<div class="eq">$$ \big((1,\ i)p_m\big)\big((1,\ i)p_n\big)^{*} = (a+bi)(c-di) = ac - adi + bci + bd = (ac+bd) + (bc-ad)i $$</div>
+<p>取实部丢掉虚部 $(bc-ad)i$，剩下：</p>
+<div class="eq">$$ \operatorname{Re}\Big[\big((1,\ i)p_m\big)\big((1,\ i)p_n\big)^{*}\Big] = ac + bd $$</div>
+<p>两边都等于 $ac+bd$，所以 $\langle p_m,p_n \rangle = \operatorname{Re}\big[(1,\ i)p_m\cdot\big((1,\ i)p_n\big)^{*}\big]$。$\blacksquare$</p>
+<p class="note">关键在<b>共轭</b>：$(-di)\cdot(bi)$ 得 $+bd$（$i\cdot(-i)=+1$），让 $b,d$ 两项相加；若不加共轭、直接乘 $(a+bi)(c+di)$，会得到 $ac - bd$（差号），那就不是内积了。</p>
+</div>
+
+<p><b>8231 式 (9)</b> —— 位置编码的解是单位复数旋转（$p_m$ 是列向量，看它的复数对应 $(1,\ i)p_m$）：</p>
+<div class="eq">$$ (1,\ i)\,p_m = e^{im\theta} \quad\Longleftrightarrow\quad p_m = \begin{pmatrix} \cos m\theta \\ \sin m\theta \end{pmatrix} $$</div>
+<p><b>8231 式 (10)</b> —— 高维 = 多个二维复数拼接（每个维度对一组频率 $\theta_i$；$p_m$ 是 $d$ 维实列向量，每一对看复数）：</p>
+<div class="eq">$$ p_m = \begin{pmatrix} \cos m\theta_0 \\ \sin m\theta_0 \\ \cos m\theta_1 \\ \sin m\theta_1 \\ \vdots \\ \cos m\theta_{d/2-1} \\ \sin m\theta_{d/2-1} \end{pmatrix} \quad\Longleftrightarrow\quad \text{第 }i\text{ 对：} (1,\ i)\,p_{m,[2i:2i+1]} = e^{im\theta_i} $$</div>
+<p><b>8231 式 (1)</b> —— 频率沿用 Sinusoidal 方案：$\theta_i = 10000^{-2i/d}$（远程衰减的来源）。</p>
+</div>
+
+<h2>第 1 步：RoPE 的复数形式（8265 式 9、10）</h2>
+<div class="step">
+<p><b>8265 式 (9)</b> —— 给 $q$ 施加位置 $m$ 的旋转，等价于复数乘法：</p>
+<div class="eq">$$ f(q,m) = e^{im\theta}\,q $$</div>
+<p><b>8265 式 (10)</b> —— 写成 2×2 旋转矩阵：</p>
+<div class="eq">$$ f(q,m) = \begin{pmatrix} \cos m\theta &amp; -\sin m\theta \\ \sin m\theta &amp; \cos m\theta \end{pmatrix} \begin{pmatrix} q_0 \\ q_1 \end{pmatrix} $$</div>
+<p class="note">👉 实际操作流程已放在<b>页面最开头</b>（🛠 绿色框），请先看那里。</p>
+</div>
+
+<h2>第 2 步：核心恒等式（8265 式 12）——相对位置如何出现</h2>
+<div class="step">
+<p>位置 $m$ 的 $q$ 旋转 $R(m\theta)$、位置 $n$ 的 $k$ 旋转 $R(n\theta)$，二者内积中绝对位置 $m,n$ 抵消：</p>
+<div class="eq">$$ (R(m\theta) q)^{\top}(R(n\theta) k) = q^{\top} R(m\theta)^{\top} R(n\theta) k = q^{\top} R((n-m)\theta)\, k $$</div>
+<p class="note">用到的性质：旋转矩阵正交且可交换 $R(m\theta)^{\top}R(n\theta) = R(-m\theta)R(n\theta) = R((n-m)\theta)$（角度相加）。</p>
+
+<div style="background:#eef7ee;border-left:4px solid #27ae60;padding:14px 18px;margin:16px 0;border-radius:4px;">
+<p><b>🔍 这个性质怎么来的？严谨证明</b></p>
+
+<p><b>核心直觉</b>：旋转就是"转角度"，先转 $m\theta$、再转 $n\theta$，共转 $(n-m)\theta$，下面从矩阵定义出发硬算。</p>
+
+<p><b>记号</b>：记 $R(\alpha)=\begin{pmatrix}\cos\alpha &amp; -\sin\alpha \\ \sin\alpha &amp; \cos\alpha\end{pmatrix}$，则 $R(m\theta)$ 表示旋转 $m\theta$、$R((n-m)\theta)$ 表示旋转 $(n-m)\theta$。</p>
+
+<div style="background:#f0f7ff;border-left:4px solid #5dade2;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>为什么 $R(\alpha)$ 是正交矩阵？</b>——直接验证 $R(\alpha)^{\top}R(\alpha)=I$：</p>
+<div class="eq">$$ R(\alpha)^{\top}R(\alpha)=\begin{pmatrix}\cos\alpha &amp; \sin\alpha \\ -\sin\alpha &amp; \cos\alpha\end{pmatrix}\begin{pmatrix}\cos\alpha &amp; -\sin\alpha \\ \sin\alpha &amp; \cos\alpha\end{pmatrix} $$</div>
+<div class="eq">$$ =\begin{pmatrix}\cos^2\alpha+\sin^2\alpha &amp; -\cos\alpha\sin\alpha+\sin\alpha\cos\alpha \\ -\sin\alpha\cos\alpha+\cos\alpha\sin\alpha &amp; \sin^2\alpha+\cos^2\alpha\end{pmatrix}=\begin{pmatrix}1 &amp; 0 \\ 0 &amp; 1\end{pmatrix}=I $$</div>
+<p class="note">用到的恒等式：$\cos^2\alpha+\sin^2\alpha=1$（勾股定理）。所以 $R(\alpha)^{\top}=R(\alpha)^{-1}$，即转置=逆；几何上等价于"旋转保内积（不改变向量长度与夹角）"，因此 $R(\alpha)$ 是<b>正交矩阵</b>。</p>
+</div>
+
+
+<div style="background:#eaf4fd;border-left:4px solid #2980b9;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>二维情形 $R(m\theta)$ 的定义</b>——把位置 $m$ 的旋转矩阵完整写出来：</p>
+<div class="eq">$$ R(m\theta) \;\overset{\text{定义}}{=}\; \begin{pmatrix} \cos m\theta &amp; -\sin m\theta \\ \sin m\theta &amp; \cos m\theta \end{pmatrix} $$</div>
+<p>它作用在二维向量 $\begin{pmatrix} x \\ y \end{pmatrix}$ 上：$R(m\theta)\begin{pmatrix} x \\ y \end{pmatrix}=\begin{pmatrix} x\cos m\theta - y\sin m\theta \\ x\sin m\theta + y\cos m\theta \end{pmatrix}$。</p>
+<p><b>每个位置的由来</b>（标准旋转矩阵 $R(\alpha)=\begin{pmatrix}\cos\alpha &amp; -\sin\alpha \\ \sin\alpha &amp; \cos\alpha\end{pmatrix}$ 中代入 $\alpha=m\theta$）：</p>
+<div class="eq">$$ R(m\theta) = \begin{pmatrix} \cos m\theta &amp; -\sin m\theta \\ \sin m\theta &amp; \cos m\theta \end{pmatrix} \begin{array}{l} \uparrow\text{ 第1列 = 基向量 }(1,0)\text{ 旋转后的落点} \\ \uparrow\text{ 第2列 = 基向量 }(0,1)\text{ 旋转后的落点} \end{array} $$</div>
+<p class="note">验证：$R(m\theta)\begin{pmatrix}1\\0\end{pmatrix}=\begin{pmatrix}\cos m\theta\\\sin m\theta\end{pmatrix}$（$(1,0)$ 转 $m\theta$ 落在单位圆上角度 $m\theta$ 处）；$R(m\theta)\begin{pmatrix}0\\1\end{pmatrix}=\begin{pmatrix}-\sin m\theta\\\cos m\theta\end{pmatrix}$。两列互相正交且为单位向量——这正是"旋转矩阵"的几何含义：把坐标基旋转 $m\theta$。</p>
+</div>
+
+<p><b>引理 1（角度相加 = 矩阵乘法的硬算结果，非假设）</b>：$R(\alpha)R(\beta)=R(\alpha+\beta)$。直接展开四个元素：</p>
+<div class="eq">$$ R(\alpha)R(\beta)=\begin{pmatrix}\cos\alpha &amp; -\sin\alpha \\ \sin\alpha &amp; \cos\alpha\end{pmatrix}\begin{pmatrix}\cos\beta &amp; -\sin\beta \\ \sin\beta &amp; \cos\beta\end{pmatrix} $$</div>
+<div class="eq">$$ =\begin{pmatrix}\cos\alpha\cos\beta-\sin\alpha\sin\beta &amp; -(\cos\alpha\sin\beta+\sin\alpha\cos\beta) \\ \sin\alpha\cos\beta+\cos\alpha\sin\beta &amp; \cos\alpha\cos\beta-\sin\alpha\sin\beta\end{pmatrix}=\begin{pmatrix}\cos(\alpha+\beta) &amp; -\sin(\alpha+\beta) \\ \sin(\alpha+\beta) &amp; \cos(\alpha+\beta)\end{pmatrix}=R(\alpha+\beta) $$</div>
+<p class="note">用到的两角和公式：$\cos(\alpha+\beta)=\cos\alpha\cos\beta-\sin\alpha\sin\beta$，$\sin(\alpha+\beta)=\sin\alpha\cos\beta+\cos\alpha\sin\beta$。这里没有假定"角度相加"——它是由矩阵乘法硬算出来的。</p>
+
+<div style="background:#fef9e7;border-left:4px solid #f1c40f;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>⚠️ 澄清：正交矩阵之间不一定可交换</b>——"正交"与"可交换"是两个独立性质。</p>
+
+<p><b>反例</b>：反射矩阵（也是正交矩阵）之间通常不可交换。取
+$H_1=\begin{pmatrix}1&0\\0&-1\end{pmatrix}$（关于 $x$ 轴反射）、
+$H_2=\frac{1}{2}\begin{pmatrix}1&-\sqrt3\\-\sqrt3&-1\end{pmatrix}$（关于 $30°$ 直线反射），两者都正交（$H_i^{\top}H_i=I$），但：</p>
+<div class="eq">$$ H_1H_2 = \frac{1}{2}\begin{pmatrix}1&-\sqrt3\\\sqrt3&1\end{pmatrix} \neq H_2H_1 = \frac{1}{2}\begin{pmatrix}1&\sqrt3\\-\sqrt3&1\end{pmatrix} $$</div>
+<p class="note">一个是旋转 $+60°$、一个是旋转 $-60°$，方向相反，所以 $H_1H_2\neq H_2H_1$。可见<b>正交</b>推不出<b>可交换</b>。</p>
+
+<p><b>那为什么我们的 $R(\alpha)$ 可交换？</b>——因为 $R(\alpha),R(\beta)$ 是<b>同一族</b>旋转矩阵（都是"转一个角度"），不是因为它正交。几何：平面里先转 $\alpha$ 再转 $\beta$，与先转 $\beta$ 再转 $\alpha$，最终结果都是转到 $\alpha+\beta$ 的位置——旋转的复合只关心"总共转了多少"，与顺序无关。上面<b>引理 1</b> 已用矩阵乘法硬算证明了 $R(\alpha)R(\beta)=R(\alpha+\beta)$：</p>
+<div class="eq">$$ R(\alpha)R(\beta)=R(\alpha+\beta)=R(\beta+\alpha)=R(\beta)R(\alpha) $$</div>
+<p class="note">本质：旋转在加法下构成<b>可交换群</b>（同构于 $\mathbb{R}$ 上的加法），而 $R(\alpha+\beta)=R(\beta+\alpha)$ 成立是因为实数加法可交换。</p>
+</div>
+
+<p><b>引理 2（转置 = 反向旋转）</b>：$R(\alpha)^{\top}=R(-\alpha)$。因为 $\cos$ 偶、$\sin$ 奇（$\cos(-\alpha)=\cos\alpha$，$\sin(-\alpha)=-\sin\alpha$）：</p>
+<div class="eq">$$ R(\alpha)^{\top}=\begin{pmatrix}\cos\alpha &amp; \sin\alpha \\ -\sin\alpha &amp; \cos\alpha\end{pmatrix}=\begin{pmatrix}\cos(-\alpha) &amp; -\sin(-\alpha) \\ \sin(-\alpha) &amp; \cos(-\alpha)\end{pmatrix}=R(-\alpha) $$</div>
+
+<p><b>主结论</b>——从 $R(m\theta)^{\top}R(n\theta)$ 出发，每一步都有据可依：</p>
+<div class="eq">$$ R(m\theta)^{\top}R(n\theta)=R(-m\theta)\,R(n\theta)=R\big((-m+n)\theta\big)=R\big((n-m)\theta\big) $$</div>
+<p class="note">依据：① 引理 2（$R(m\theta)^{\top}=R(-m\theta)$）；② 引理 1（角度相加，取 $\alpha=-m\theta,\ \beta=n\theta$）；③ 实数加法交换律 $(-m+n)=(n-m)$；④ 结果记为 $R((n-m)\theta)$。$\blacksquare$</p>
+</div>
+</div>
+
+<h2>第 3 步：推导式 (14) —— 内积拆成各二维子块 <span style="background:#f39c12;color:#fff;padding:2px 10px;border-radius:10px;font-size:0.8em;">选读</span></h2>
+<p class="note" style="background:#fef9e7;border-left:4px solid #f1c40f;padding:8px 12px;border-radius:4px;">📖 <b>选读说明</b>：第 3~5 步不涉及 RoPE 的<b>操作步骤</b>，而是用来证明 RoPE 具有<b>远程衰减性质</b>（相距越远，注意力分数越小）。只想用 RoPE / 理解它是怎么算的，看到第 2 步即可；对「为什么远程衰减」感兴趣再往下读。</p>
+<p><b>记号</b>：把 $q,k$ 两两分组，$q_{[2i:2i+1]} = \binom{q_{2i}}{q_{2i+1}}$、$k_{[2i:2i+1]} = \binom{k_{2i}}{k_{2i+1}}$ 表示第 $i$ 对维度的子向量（都是二维<b>列</b>向量）。</p>
+<div class="ref">
+<p><b>8265 原文的式 (11)、(12)、(14)</b> —— 第 3 步的前置定义与目标结论：</p>
+
+<p><b>式 (11)</b> —— 高维旋转矩阵是<b>块对角</b>的：每 2 维一个 $2\times2$ 旋转块，共 $d/2$ 块，第 $i$ 块用频率 $\theta_i$，作用于 $\boldsymbol{q}$：</p>
+<div class="eq">$$ R(m\theta) = \begin{pmatrix} \cos m\theta_0 &amp; -\sin m\theta_0 &amp; 0 &amp; 0 &amp; \cdots &amp; 0 &amp; 0 \\ \sin m\theta_0 &amp; \cos m\theta_0 &amp; 0 &amp; 0 &amp; \cdots &amp; 0 &amp; 0 \\ 0 &amp; 0 &amp; \cos m\theta_1 &amp; -\sin m\theta_1 &amp; \cdots &amp; 0 &amp; 0 \\ 0 &amp; 0 &amp; \sin m\theta_1 &amp; \cos m\theta_1 &amp; \cdots &amp; 0 &amp; 0 \\ \vdots &amp; \vdots &amp; \vdots &amp; \vdots &amp; \ddots &amp; \vdots &amp; \vdots \\ 0 &amp; 0 &amp; 0 &amp; 0 &amp; \cdots &amp; \cos m\theta_{d/2-1} &amp; -\sin m\theta_{d/2-1} \\ 0 &amp; 0 &amp; 0 &amp; 0 &amp; \cdots &amp; \sin m\theta_{d/2-1} &amp; \cos m\theta_{d/2-1} \end{pmatrix},\qquad \boldsymbol{f}(\boldsymbol{q},m)=R(m\theta)\boldsymbol{q} $$</div>
+<p class="note">本文沿用第 2 步记号，用 $R(m\theta)$ 表示这个块对角旋转矩阵（第 $i$ 个 $2\times2$ 旋转块用频率 $\theta_i$）。</p>
+
+<p><b>式 (12)</b> —— 左边 $(R(m\theta)\boldsymbol{q})^{\top}(R(n\theta)\boldsymbol{k})$ 就是旋转后 $\boldsymbol{q},\boldsymbol{k}$ 的<b>内积</b> $\langle R(m\theta)\boldsymbol{q}, R(n\theta)\boldsymbol{k}\rangle$。因为旋转矩阵满足 $R(m\theta)^{\top}R(n\theta)=R((n-m)\theta)$（第 2 步主结论），绝对位置 $m,n$ 抵消，内积只依赖相对位置 $n-m$：</p>
+<div class="eq">$$ \langle R(m\theta)\boldsymbol{q},\, R(n\theta)\boldsymbol{k}\rangle = (R(m\theta) \boldsymbol{q})^{\top}(R(n\theta) \boldsymbol{k}) = \boldsymbol{q}^{\top} R(m\theta)^{\top}R(n\theta) \boldsymbol{k} = \boldsymbol{q}^{\top} R((n-m)\theta) \boldsymbol{k} $$</div>
+
+<p><b>式 (14)</b> —— 把内积拆成各二维子块（第 3 步要证明的结论）：</p>
+<div class="eq">$$ (R(m\theta) \boldsymbol{q})^{\top}(R(n\theta) \boldsymbol{k}) = \sum_{i=0}^{d/2-1} \operatorname{Re}\Big[(1,i)\boldsymbol{q}_{[2i:2i+1]}\,\big((1,i)\boldsymbol{k}_{[2i:2i+1]}\big)^{*}\, e^{i(m-n)\theta_i}\Big] $$</div>
+</div>
+
+<div class="step">
+<p class="note">8231 式 (6) 的复数技巧只做一件事：把内积换成复数相乘取实部。它<b>并不</b>要求乘以 $e^{i(m-n)\theta_i}$——那个 $e^{\cdots}$ 是<b>旋转矩阵带来的</b>（见下方关键一步）。全文 $q_{[2i:2i+1]}$、$k_{[2i:2i+1]}$ 一律表示列向量，复数化显式写成 $(1,i)\cdot$ 左乘。</p>
+
+<p>先看第 $i$ 对维度旋转后的内积，从矩阵形式出发：</p>
+<div class="eq">$$ (R(m\theta_i)q_{[2i:2i+1]})^{\top}(R(n\theta_i)k_{[2i:2i+1]}) = \big\langle R(m\theta_i)q_{[2i:2i+1]},\, R(n\theta_i)k_{[2i:2i+1]}\big\rangle $$</div>
+<p>用第 0 步式 (6) 的结论 $\langle p,q\rangle=\operatorname{Re}\big[(1,i)p\cdot((1,i)q)^{*}\big]$，把内积换成复数运算：</p>
+<div class="eq">$$ \big\langle R(m\theta_i)q_{[2i:2i+1]},\, R(n\theta_i)k_{[2i:2i+1]}\big\rangle = \operatorname{Re}\Big[(1,i)\,R(m\theta_i)q_{[2i:2i+1]}\,\big((1,i)\,R(n\theta_i)k_{[2i:2i+1]}\big)^{*}\Big] $$</div>
+<p><b>关键一步</b>——行向量 $(1,i)$ 左乘旋转矩阵，等于<b>先复数化、再乘单位复指数</b>。下面用 $\alpha=m\theta_i$ 逐步硬算（每步标注依据，等号对齐）：</p>
+<div class="eq">$$ \begin{aligned} (1,i)\,R(\alpha) &= (1,i)\begin{pmatrix}\cos\alpha &amp; -\sin\alpha \\ \sin\alpha &amp; \cos\alpha\end{pmatrix} \\[2pt] &= (\cos\alpha+i\sin\alpha,\ \underbrace{-\sin\alpha+i\cos\alpha}_{\text{第 2 分量}}) &&\text{（行向量左乘矩阵：第 }j\text{ 分量} = \sum_k (1,i)_k R_{kj}\text{）} \\[2pt] &= (\cos\alpha+i\sin\alpha,\ i(\cos\alpha+i\sin\alpha)) &&\text{（提 }i\text{：}-\sin\alpha+i\cos\alpha=i(\cos\alpha+i\sin\alpha)\text{）} \\[2pt] &= (e^{i\alpha},\ i e^{i\alpha}) &&\text{（欧拉公式：}\cos\alpha+i\sin\alpha=e^{i\alpha}\text{）} \\[2pt] &= e^{i\alpha}(1,\ i) &&\text{（每个分量提出公因子 }e^{i\alpha}\text{）} \end{aligned} $$</div>
+<p class="note">几何直观：旋转矩阵的第 2 列恰是第 1 列乘 $i$（$\binom{-\sin\alpha}{\cos\alpha}=i\binom{\cos\alpha}{\sin\alpha}$），所以 $(1,i)$ 左乘后两分量只差一个 $i$，共同提出 $e^{i\alpha}$（提到前面，与后文一致）。代入 $\alpha=m\theta_i$、$n\theta_i$ 得：</p>
+<div class="eq">$$ (1,i)\,R(m\theta_i) = e^{im\theta_i}(1,i),\qquad (1,i)\,R(n\theta_i) = e^{in\theta_i}(1,i) $$</div>
+<p>代入，并把共轭翻转 $e^{in\theta_i}$ 的角度符号：</p>
+<div class="eq">$$ = \operatorname{Re}\Big[e^{im\theta_i}(1,i)q_{[2i:2i+1]}\,\big(e^{in\theta_i}(1,i)k_{[2i:2i+1]}\big)^{*}\Big] = \operatorname{Re}\Big[(1,i)q_{[2i:2i+1]}\,\big((1,i)k_{[2i:2i+1]}\big)^{*}\,e^{i(m-n)\theta_i}\Big] $$</div>
+<p>展开：$(1,i)q_{[2i:2i+1]}=q_{2i}+iq_{2i+1}$、$(1,i)k_{[2i:2i+1]}=k_{2i}+ik_{2i+1}$，乘积的共轭 $\big((1,i)q_{[2i:2i+1]}\big)\big((1,i)k_{[2i:2i+1]}\big)^{*}=(q_{2i}+iq_{2i+1})(k_{2i}-ik_{2i+1})$ 的实部恰是这对维度的内积 $q_{2i}k_{2i}+q_{2i+1}k_{2i+1}$（第 0 步式 6 证明过）。于是得到这一对的二维内积：</p>
+<div class="eq">$$ \boxed{ (R(m\theta_i)q_{[2i:2i+1]})^{\top}(R(n\theta_i)k_{[2i:2i+1]}) = \operatorname{Re}\Big[(1,i)q_{[2i:2i+1]}\;\big((1,i)k_{[2i:2i+1]}\big)^{*}\,e^{i(m-n)\theta_i}\Big] } $$</div>
+
+<div style="background:#eef7ee;border-left:4px solid #27ae60;padding:12px 16px;margin:12px 0;border-radius:4px;">
+<p><b>🔍 澄清：二维旋转怎么变成 $d$ 维的累加 $\sum$？</b></p>
+
+<p>关键在式 (11)：$R(m\theta)$ 是<b>块对角</b>矩阵，对角线上一字排开 $d/2$ 个 $2\times2$ 旋转块，其它位置全 $0$。块对角矩阵乘向量的规则：<b>每个块只作用于自己那 2 维</b>，互不干扰——</p>
+<div class="eq">$$ \begin{aligned} R(m\theta)\boldsymbol{q} &= \begin{pmatrix} \boxed{R(m\theta_0)} &amp; &amp; \\ &amp; \boxed{R(m\theta_1)} &amp; \\ &amp; &amp; \ddots &amp; \\ &amp; &amp; &amp; \boxed{R(m\theta_{d/2-1})} \end{pmatrix}\begin{pmatrix} q_0\\q_1\\ \hline q_2\\q_3\\ \hline \vdots \\ \hline q_{d-2}\\q_{d-1} \end{pmatrix} \\[4pt] &= \begin{pmatrix} R(m\theta_0)\binom{q_0}{q_1} \\ R(m\theta_1)\binom{q_2}{q_3} \\ \vdots \\ R(m\theta_{d/2-1})\binom{q_{d-2}}{q_{d-1}} \end{pmatrix} \\[4pt] &= \begin{pmatrix} R(m\theta_0)\,q_{[0:1]} \\ R(m\theta_1)\,q_{[2:3]} \\ \vdots \\ R(m\theta_{d/2-1})\,q_{[d-2:d-1]} \end{pmatrix} &&\kern-3em\text{（每块简写：}R(m\theta_i)\,q_{[2i:2i+1]}=R(m\theta_i)\binom{q_{2i}}{q_{2i+1}}\text{）} \end{aligned} $$</div>
+<p class="note">第 $i$ 个块 $R(m\theta_i)$ 只碰 $(q_{2i},q_{2i+1})$，其它维度原样不动。所以 <b>$d$ 维旋转 = 在每个 2 维子空间上并行做刚才那个二维旋转</b>，频率 $\theta_0,\theta_1,\ldots$ 各不相同（这就是 8231 式 10 的"拼接"）。</p>
+
+<p><b>那为什么内积变成累加 $\sum$？</b>——因为旋转后的 $\boldsymbol{q},\boldsymbol{k}$ 各自都是分块独立的：</p>
+<div class="eq">$$ \begin{aligned} (R(m\theta)\boldsymbol{q})^{\top}(R(n\theta)\boldsymbol{k}) &= \begin{pmatrix} R(m\theta_0)\,q_{[0:1]} \\ R(m\theta_1)\,q_{[2:3]} \\ \vdots \\ R(m\theta_{d/2-1})\,q_{[d-2:d-1]} \end{pmatrix}^{\top}\!\begin{pmatrix} R(n\theta_0)\,k_{[0:1]} \\ R(n\theta_1)\,k_{[2:3]} \\ \vdots \\ R(n\theta_{d/2-1})\,k_{[d-2:d-1]} \end{pmatrix} \\[4pt] &= \sum_{i=0}^{d/2-1} \big(R(m\theta_i)\,q_{[2i:2i+1]}\big)^{\top}\big(R(n\theta_i)\,k_{[2i:2i+1]}\big) \\[4pt] &= \sum_{i=0}^{d/2-1} \operatorname{Re}\Big[(1,i)q_{[2i:2i+1]}\;\big((1,i)k_{[2i:2i+1]}\big)^{*}\,e^{i(m-n)\theta_i}\Big] &&\text{（代回已证的二维内积公式）} \end{aligned} $$</div>
+</div>
+
+</div>
+
+<h2>第 4 步：推导式 (15) —— Abel 变换（分部求和） <span style="background:#f39c12;color:#fff;padding:2px 10px;border-radius:10px;font-size:0.8em;">选读</span></h2>
+<div class="step">
+<p><b>记法</b>（8265 原文）：</p>
+<div class="eq">$$ h_i = (1,i)q_{[2i:2i+1]}\,\big((1,i)k_{[2i:2i+1]}\big)^{*}, \qquad S_j = \sum_{i=0}^{j-1} e^{i(m-n)\theta_i}, \qquad h_{d/2}=0,\ \ S_0 = 0 $$</div>
+<p>于是 $e^{i(m-n)\theta_i} = S_{i+1} - S_i$（$S_{i+1}$ 比 $S_i$ 多加了第 $i$ 项）。代入求和：</p>
+<div class="eq">$$ \sum_{i=0}^{d/2-1} h_i\, e^{i(m-n)\theta_i} = \sum_{i=0}^{d/2-1} h_i\,(S_{i+1}-S_i) $$</div>
+<p><b>Abel 变换</b>（类比分部积分 $\int u\,dv = uv - \int v\,du$：把"差分 $S_{i+1}-S_i$"转成"差分 $h_{i+1}-h_i$"）——展开错位相消，利用 $S_0=0$ 与 $h_{d/2}=0$：</p>
+<div class="eq">$$ \sum_{i=0}^{d/2-1} h_i\,(S_{i+1}-S_i) = \sum_{i=0}^{d/2-1} h_i S_{i+1} - \sum_{i=0}^{d/2-1} h_i S_i = \sum_{i=0}^{d/2-1} h_i S_{i+1} - \sum_{i=1}^{d/2-1} h_i S_i $$</div>
+<p>合并同类项（利用 $h_{d/2}=0$ 与 $S_0=0$ 使边界项消失）：</p>
+<div class="eq">$$ = h_{d/2-1} S_{d/2} - h_0 S_0 - \sum_{i=1}^{d/2-1} (h_i - h_{i-1}) S_i = -\sum_{i=0}^{d/2-1} S_{i+1}\,(h_{i+1} - h_i) $$</div>
+<p>于是得到 <b>式 (15)</b>：</p>
+<div class="eq" style="background:#eaf4fd;border-left:4px solid #2980b9;padding:10px 16px;border-radius:4px;">
+$$ \boxed{ \sum_{i=0}^{d/2-1} h_i\,e^{i(m-n)\theta_i} = \sum_{i=0}^{d/2-1} h_i\,(S_{i+1}-S_i) = -\sum_{i=0}^{d/2-1} S_{i+1}\,(h_{i+1}-h_i) } \tag{15} $$
+</div>
+</div>
+
+<h2>第 5 步：为什么式 (15) 能证明远程衰减（8265 式 16 预告） <span style="background:#f39c12;color:#fff;padding:2px 10px;border-radius:10px;font-size:0.8em;">选读</span></h2>
+<div class="step">
+<p>对式 (15) 取模，用三角不等式，把 $|h_{i+1}-h_i|$（相邻子块内积的差）提出来：</p>
+<div class="eq">$$ \left| \sum_{i=0}^{d/2-1} h_i\,e^{i(m-n)\theta_i} \right| \le \left(\max_i |h_{i+1}-h_i|\right) \sum_{i=0}^{d/2-1} |S_{i+1}| $$</div>
+<p>当 $|m-n|$ 很大时，$S_j = \sum_{i=0}^{j-1} e^{i(m-n)\theta_i}$ 是高频振荡复指数之和，其模长 $|S_j|$ 平均趋于很小（各频率 $\theta_i$ 分散、相位错开互相抵消）——这正是 8231 中"高频振荡积分渐近趋零"思想的离散版本。所以整体内积随相对距离衰减。</p>
+</div>
+
+<h2>推导用到的定义来源对照</h2>
+<table>
+<tr><th>定义</th><th>来源</th><th>作用</th></tr>
+<tr><td>$\langle p_m,p_n \rangle = \operatorname{Re}[(1,\ i)p_m\cdot\big((1,\ i)p_n\big)^{*}]$</td><td>8231 式 (6)</td><td>把内积换成复数运算</td></tr>
+<tr><td>$(1,\ i)p_m = e^{im\theta}$</td><td>8231 式 (9)</td><td>位置 = 单位旋转</td></tr>
+<tr><td>高维拼接 $e^{im\theta_i}$</td><td>8231 式 (10)</td><td>扩展到 $d$ 维</td></tr>
+<tr><td>$f(q,m)=e^{im\theta}q$</td><td>8265 式 (9)</td><td>RoPE 复数形式</td></tr>
+<tr><td>$R(m\theta)$ 块对角旋转</td><td>8265 式 (11)</td><td>RoPE 矩阵形式</td></tr>
+<tr><td>$(R(m\theta) q)^{\top}(R(n\theta) k)=q^{\top} R((n-m)\theta)k$</td><td>8265 式 (12)</td><td>相对位置核心</td></tr>
+<tr><td>频率 $\theta_i = 10000^{-2i/d}$</td><td>8231 式 (1) / 8265</td><td>远程衰减根源</td></tr>
+</table>
+
+</body>
+</html>
